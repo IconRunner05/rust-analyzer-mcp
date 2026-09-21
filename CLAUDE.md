@@ -1,143 +1,113 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for Claude Code (claude.ai/code) working in this repository.
 
 ## Project Overview
 
-rust-analyzer-mcp is a Model Context Protocol (MCP) server that provides integration with rust-analyzer LSP, allowing AI assistants to analyze Rust code through standardized tools. The server acts as a bridge between MCP clients and rust-analyzer, translating MCP tool calls into LSP requests.
+`rust-analyzer-mcp` is an MCP server fronting `rust-analyzer` over LSP, so that an assistant can
+ask about Rust code by symbol rather than by text. This is the `IconRunner05` fork of
+`zeenix/rust-analyzer-mcp`; `upstream` is the original and prefer upstreaming a fix over carrying
+it.
+
+`--version` says which build is installed — the fork and the crates.io crate share a `version`, so
+the revision and tool count are what tell them apart:
+
+```
+rust-analyzer-mcp 0.4.0 (fork, rev 9d3233e, 21 tools)
+```
 
 ## Architecture
 
-The codebase follows a modular architecture:
+Four layers, each a directory, with the protocol types they speak kept apart from the code that
+speaks them:
 
-- **Main MCP Server** (`src/main.rs`): Handles MCP protocol, manages rust-analyzer subprocess, and routes tool calls to LSP methods
-- **Test Support Library** (`test-support/`): Provides `MCPTestClient` for integration testing with proper process lifecycle management
-- **Test Structure**:
-  - `tests/integration/`: Core MCP server integration tests
-  - `tests/stress/`: Concurrency and performance stress tests
-  - `tests/unit/`: Protocol and component unit tests
-  - `tests/property/`: Property-based fuzzing tests
+- **`src/main.rs`** — 49 lines. Parses the command line, builds the server, runs it on a Tokio
+  runtime, and shuts that runtime down in the background because Tokio's stdin reader parks an
+  uncancellable blocking read that would otherwise hang the process on a signal.
+- **`src/cli.rs`** — hand-rolled argument parsing (no clap) into an `Action`. Takes `OsString`s so
+  a workspace path that is not valid UTF-8 is passed through rather than rejected.
+- **`src/mcp/`** — the MCP half. `server.rs` owns the request loop and the map of workspace root →
+  client; `tools.rs` is the tool definitions and their annotations; `handlers.rs` is one function
+  per tool.
+- **`src/lsp/`** — the rust-analyzer half. `connection.rs` is the subprocess and framing,
+  `client.rs` the initialize sequence and document state, `handlers.rs` one method per LSP request.
+- **`src/protocol/`** — the wire types for both, `mcp.rs` and `lsp.rs`.
+- **Leaf modules** — `uri.rs` (path ↔ URI, including Windows spellings), `position.rs`,
+  `locations.rs` (turning LSP `Location`s into readable hits), `blast.rs` (the test/production
+  partition), `diagnostics/`, `settings.rs`, `config.rs`.
+- **`build.rs`** — records the git revision into the binary, which is what makes `--version`
+  able to answer.
 
-Key architectural decisions:
-- Uses Tokio async runtime for concurrent request handling
-- Maintains persistent rust-analyzer subprocess for performance
-- Implements proper LSP initialization sequence with workspace support
-- Handles CI environment detection for test reliability
+### Decisions worth knowing before changing anything
+
+- **One `rust-analyzer` per workspace root**, cached in `server.clients`. A call may carry
+  `workspace_path` and is then answered by that workspace's own client *for that call only*, with
+  the default left where it is — so concurrent callers can work in different repos. Only
+  `set_workspace` moves the default, and doing so respawns `rust-analyzer` and reindexes.
+- **Reads are gated on the index** (`ensure_index_ready`). Everything worked out from the whole
+  workspace answers `null` or `[]` until that workspace is loaded, and those are the same answers
+  given for a symbol nothing refers to and a position that is not on a symbol. The gate turns the
+  wait into an error that says so. `symbols` is deliberately ungated — it is syntactic and answers
+  from the one file — but retries behind the gate if the answer is `null`.
+- **An empty answer is explained** (`explain_empty_answer`) when the loaded workspace accounts for
+  it: a file outside the root, or a root with no `Cargo.toml`.
+- **Coordinates are 0-based**, and positions are on the identifier. `symbols` returns hierarchical
+  `DocumentSymbol`s, so `selectionRange.start` is the identifier and `range.start` is the doc
+  comment.
+- **Nothing here writes to a file.** `format`, `rename` and `ssr` all work out an edit and hand it
+  back; applying it is the caller's decision. That is why all three are annotated `readOnlyHint`.
 
 ## Development Commands
 
-### Building and Running
-
 ```bash
-# Development build and run
-cargo build
-cargo run -- /path/to/workspace
-
-# Release build (optimized with LTO)
-cargo build --release
-
-# Run with debug logging
+cargo build                      # development build
+cargo run -- /path/to/workspace  # run against a workspace
+cargo run -- --version           # which build is this
+cargo build --release            # optimized, LTO
 RUST_LOG=debug cargo run -- /path/to/workspace
-```
 
-### Testing
-
-```bash
-# Run all tests
-cargo test
-
-# Run specific test
-cargo test test_concurrent_tool_calls
-
-# Run tests in release mode (for stress tests)
-cargo test --release
-
-# Run integration tests only
-cargo test --test integration_tests
-
-# Run with verbose output to debug failures
+cargo test                       # everything
+cargo test --lib blast           # one module's unit tests
+cargo test --test integration_tests ssr
 cargo test -- --nocapture
 
-# Run tests with specific timeout debugging
-RUST_BACKTRACE=1 cargo test --test integration_tests test_all_lsp_tools
+cargo +nightly fmt               # format
+cargo clippy --all-targets -- -D warnings   # the CI gate
 ```
 
-### Linting and Formatting
+## Testing
 
-```bash
-# Format code
-cargo +nightly fmt
+- `tests/integration/` — one file per area, against a real server over a Unix socket
+  (`test-support`, `IpcClient::get_or_create`, which shares one server between tests).
+- `tests/unit/`, `tests/property/`, `tests/stress/` — protocol shapes, fuzzing, concurrency.
+- `test-project/` and `test-project-diagnostics/` — fixtures. They are `exclude`d from the
+  workspace so their faults are not the workspace's faults.
 
-# Run clippy linter
-cargo clippy -- -D warnings
+**Every fixture and assertion must be able to fail for the reason it exists.** Ask of a check what
+it would print if the thing it guards were completely broken; if the answer is "it passes", the
+check is decoration. Two measured examples from this repo:
 
-# Check without building
-cargo check
-```
+- A diagnostics fixture with **one** faulted file cannot tell "the file you opened" from "the whole
+  workspace", so it matched `cargo` while the tool reported the wrong set entirely. A workspace
+  test needs at least two faulted files in two files.
+- `test-project/src/blast_fixture.rs` exists because a test/production split is only falsifiable
+  when production code and its `#[cfg(test)]` tests share a file. A split by filename reports 3
+  production callers and 0 tests there; the real one reports 1 and 2.
 
-## CI Considerations
+Confirm a new check by deliberately breaking what it guards and watching it go red. Every number
+matching on the first try is a reason to test whether the fixture discriminates, not evidence that
+it does.
 
-The test suite includes CI-specific handling to ensure reliability in GitHub Actions:
+### CI
 
-- Tests detect CI environment via `std::env::var("CI")`
-- In CI, concurrent tests run in smaller batches to avoid overwhelming the system
-- Tool call timeouts are extended from 10s to 30s in CI environments
-- The `test_rapid_fire_requests` test adds small delays between spawns in CI only
-
-When debugging CI failures, check for:
-- rust-analyzer initialization timeouts (30s timeout in CI)
-- Concurrent request handling (batched in CI vs full concurrency locally)
-- Success thresholds adjusted for CI reliability
-
-## Test Project
-
-The `test-project/` directory contains a minimal Rust project used for integration testing. It includes:
-- Basic functions (`greet`, `Calculator` struct) for testing LSP features
-- Positioned specifically to test definition, references, hover, and completion at known locations
-
-## Key Implementation Details
-
-### MCP Protocol Handling
-- Implements full MCP initialize sequence with tool discovery
-- Returns proper JSON-RPC responses with error handling
-- Tools return results wrapped in MCP content items
-
-### rust-analyzer Integration
-- Spawns rust-analyzer as subprocess with stdio communication
-- Implements proper LSP initialization with workspace capabilities
-- Opens documents before LSP operations to ensure proper analysis
-- Handles async LSP responses with request ID tracking
-
-### Tool Reliability
-- Symbols tool polls until rust-analyzer completes indexing
-- Definition/references tools handle null responses during initialization
-- Format tool requires document to be opened first
-- Completion tool may return null during indexing
+Tests detect CI via `std::env::var("CI")` and adjust: concurrent tests run in smaller batches,
+tool-call timeouts go from 10s to 30s, and `test_rapid_fire_requests` spaces out its spawns. When a
+CI failure does not reproduce locally, look there first.
 
 ## Git Commit Conventions
 
-Use gitmoji for commit messages. Refer to the official gimoji list at:
-- Interactive picker: https://zeenix.github.io/gimoji/
-- Raw database: https://zeenix.github.io/gimoji/emojis.json
+Use gitmoji. Picker: https://zeenix.github.io/gimoji/ · raw: https://zeenix.github.io/gimoji/emojis.json
 
-## Testing Patterns
-
-### Integration Tests
-- Use `MCPTestClient::initialize_and_wait()` to ensure rust-analyzer is ready
-- Check for both successful responses and null handling
-- Test invalid inputs for error handling
-
-### Stress Tests
-- Test concurrent requests with `futures::future::join_all`
-- Verify memory stability with repeated operations
-- Test rapid-fire sequential requests for throughput
-
-### CI-Specific Testing
-```rust
-// Pattern for CI-specific behavior
-if std::env::var("CI").is_ok() {
-    // CI-specific handling (batching, delays, extended timeouts)
-} else {
-    // Local development (full concurrency, normal timeouts)
-}
-```
+Write the message about the problem, not the patch: what went wrong, what it looked like when it
+did, and why this is the fix. The measurement that established a bug belongs in the commit that
+fixes it.

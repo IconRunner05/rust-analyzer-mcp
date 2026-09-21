@@ -213,6 +213,22 @@ What no reference edge can see is a *copy*: code pasted into another crate has n
 symbol and appears nowhere in the answer. A repo-wide text sweep for the name is the other half of
 that question.
 
+#### `rust_analyzer_ssr`
+Structural search and replace whose patterns are resolved by type rather than matched as text.
+
+**Parameters:**
+- `query`: `pattern ==>> replacement`, where `$name` binds an expression
+- `file_path`: A Rust file whose module the pattern's paths are resolved from
+- `line`, `character`: Optional position to resolve from; defaults to the top of the file
+- `parse_only`: Optional; check the query is well formed without searching for it
+
+`Foo::bar($a) ==>> Foo::baz($a)` matches the `Foo` in scope at the position. A syntactic rewriter
+matches every type spelled `Foo` in the workspace, because to a syntax tree that is all the name
+is — which is the difference this tool exists for.
+
+Nothing is written: the answer is a workspace edit, worked out and handed back, so an unfamiliar
+query can be asked and read before anything is changed.
+
 #### `rust_analyzer_hover`
 Get hover information (documentation, type info) for a symbol at a specific position.
 
