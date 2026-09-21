@@ -52,6 +52,35 @@ pub fn get_tools() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            name: "rust_analyzer_blast_radius".to_string(),
+            description: "What breaks if the symbol at a position changes. One call for the \
+                          question a reference list is usually standing in for: every reference, \
+                          split into production code and tests, each production hit named by the \
+                          item it is inside and each test hit named by the test that would have to \
+                          be rerun, plus the trait impls that must change whether or not anything \
+                          calls them. The split is made from rust-analyzer's own test runnables, \
+                          not from filenames, so a `#[cfg(test)] mod tests` sharing a file with \
+                          the code it tests lands on the test side where a filename rule would \
+                          report zero tests. The position is checked with a hover before anything \
+                          is searched, so an empty answer here cannot be a wrong coordinate. Read \
+                          `complete` before the counts: false means some file could not be \
+                          classified and the counts are lower bounds. Reference edges cannot see a \
+                          copy -- code pasted into another crate has no edge to this symbol and \
+                          appears nowhere here -- so a repo-wide text sweep for the name is the \
+                          other half of the question."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "workspace_path": { "type": "string", "description": "Workspace this call is about, for when the server is shared and its default may be somebody else's project. That workspace's own rust-analyzer answers, and the default is left where it is. Must contain a Cargo.toml" },
+                    "file_path": { "type": "string", "description": "Path to the Rust file: relative to the workspace root, absolute, or a file:// URI" },
+                    "line": { "type": "number", "description": "Line number (0-based) of the symbol's identifier" },
+                    "character": { "type": "number", "description": "Character position (0-based) of the symbol's identifier" }
+                },
+                "required": ["file_path", "line", "character"]
+            }),
+        },
+        ToolDefinition {
             name: "rust_analyzer_completion".to_string(),
             description: "Get code completion suggestions at a specific position".to_string(),
             input_schema: json!({

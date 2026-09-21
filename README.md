@@ -189,6 +189,30 @@ Find all references to a symbol at a specific position.
 - `line`: Line number (0-based)
 - `character`: Character position (0-based)
 
+#### `rust_analyzer_blast_radius`
+What breaks if the symbol at a position changes: every reference, split into production code and
+tests, plus the trait impls that must change whether or not anything calls them.
+
+**Parameters:**
+- `file_path`: Path to the Rust file
+- `line`: Line number (0-based) of the symbol's identifier
+- `character`: Character position (0-based) of the symbol's identifier
+
+Each production hit is named by the item it is inside (`Calculator::add`), and each test hit by the
+test that would have to be rerun. The split is made from rust-analyzer's own test runnables rather
+than from filenames, because Rust puts a crate's unit tests in a `#[cfg(test)] mod tests` beside the
+code they test: a filename rule reports every one of them as a production caller and the test count
+as zero.
+
+The position is checked with a hover before anything is searched, and a position that is not on a
+symbol is an error rather than an empty answer — so a zero from this tool is a measured zero. Read
+`complete` before the counts: `false` means some file could not be classified and its hits are
+listed under `unclassified`, leaving the counts as lower bounds.
+
+What no reference edge can see is a *copy*: code pasted into another crate has no edge to this
+symbol and appears nowhere in the answer. A repo-wide text sweep for the name is the other half of
+that question.
+
 #### `rust_analyzer_hover`
 Get hover information (documentation, type info) for a symbol at a specific position.
 

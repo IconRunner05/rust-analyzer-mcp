@@ -55,3 +55,7 @@ pub fn handle_option(opt: Option<String>) {
         None => {}
     }
 }
+
+// Declared last on purpose: every other test in this suite cites a line number in this file, and
+// a `mod` at the top would move all of them.
+pub mod blast_fixture;

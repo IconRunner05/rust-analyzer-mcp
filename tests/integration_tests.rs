@@ -1,4 +1,5 @@
 mod integration {
+    mod blast_radius;
     mod diagnostics;
     mod edits;
     mod extensions;

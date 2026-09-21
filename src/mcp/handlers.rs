@@ -2,11 +2,13 @@ use anyhow::{anyhow, Result};
 use log::debug;
 use serde_json::{json, Value};
 use std::{
+    collections::BTreeMap,
     path::{Path, PathBuf},
     time::Duration,
 };
 
 use crate::{
+    blast,
     config::WORKSPACE_LOAD_TIMEOUT_SECS,
     diagnostics::format_diagnostics,
     locations,
@@ -172,6 +174,7 @@ async fn dispatch(
         "rust_analyzer_hover" => handle_hover(server, args).await,
         "rust_analyzer_definition" => handle_definition(server, args).await,
         "rust_analyzer_references" => handle_references(server, args).await,
+        "rust_analyzer_blast_radius" => handle_blast_radius(server, args).await,
         "rust_analyzer_completion" => handle_completion(server, args).await,
         "rust_analyzer_symbols" => handle_symbols(server, args).await,
         "rust_analyzer_workspace_symbols" => handle_workspace_symbols(server, args).await,
@@ -264,6 +267,136 @@ async fn handle_references(server: &mut RustAnalyzerMCPServer, args: Value) -> R
             text: serde_json::to_string_pretty(&result)?,
         }],
     })
+}
+
+/// What breaks if the symbol at a position changes.
+///
+/// Everything here can be had one call at a time, and asking it that way goes wrong in two
+/// places. The cheap one is arithmetic: a symbol with references in eight files takes a hover, a
+/// references, a definition, an implementation and two calls per file to classify, and a caller
+/// doing that by hand stops early and reports what it got.
+///
+/// The one that matters is the hover. It is the only thing that separates "nothing uses this"
+/// from "that position is not on a symbol", the two answers that arrive identically and lead
+/// opposite ways, and it is the step a caller in a hurry skips -- so it is done here first, and
+/// its absence is an error rather than an empty answer. A zero out of this tool is a measured
+/// zero.
+async fn handle_blast_radius(
+    server: &mut RustAnalyzerMCPServer,
+    args: Value,
+) -> Result<ToolResult> {
+    let file_path = ToolParams::extract_file_path(&args)?;
+    let (line, character) = ToolParams::extract_position(&args)?;
+
+    let uri = server.open_document_if_needed(&file_path).await?;
+
+    let Some(client) = server.client() else {
+        return Err(anyhow!("Client not initialized"));
+    };
+    ensure_index_ready(client).await?;
+
+    let hover = client.hover(&uri, line, character).await?;
+    let Some(signature) = blast::hover_signature(&hover) else {
+        explain_empty_answer(server, &hover, &file_path)?;
+        return Err(anyhow!(
+            "Nothing is at {}:{}:{} -- rust-analyzer has no hover there, so it has no symbol \
+             there either. Every answer this tool could give about that position would be an \
+             empty list, and an empty list here would read as a symbol nothing uses. Positions \
+             are 0-based and must be on the identifier itself: rust_analyzer_symbols gives them \
+             as `selectionRange.start`, rust_analyzer_workspace_symbols by name.",
+            file_path,
+            line,
+            character
+        ));
+    };
+
+    let references = client.references(&uri, line, character).await?;
+    let definition = client.definition(&uri, line, character).await?;
+    let implementations = client.implementation(&uri, line, character).await?;
+
+    let annotated = locations::annotate(&references, &server.workspace_root, &definition);
+
+    // Classifying a hit needs two things about the file it is in, and both are per file rather
+    // than per hit: which of its ranges rust-analyzer would run as tests, and what its items are.
+    // References cluster, so this is a handful of round trips even for a widely-used symbol.
+    let mut context: BTreeMap<String, blast::FileContext> = BTreeMap::new();
+    for path in referenced_files(&references) {
+        let shown = path
+            .strip_prefix(&server.workspace_root)
+            .unwrap_or(&path)
+            .display()
+            .to_string();
+        if context.contains_key(&shown) {
+            continue;
+        }
+
+        let Some(file) = path.to_str() else { continue };
+        let file_uri = server.open_document_if_needed(file).await?;
+        let Some(client) = server.client() else {
+            return Err(anyhow!("Client not initialized"));
+        };
+
+        // `runnables` is a rust-analyzer extension, and a build that does not answer it must not
+        // have its silence read as "this file has no tests in it" -- that is the reading that
+        // puts test callers under production. `None` says nobody knows, and `assemble` reports
+        // those hits as unclassified rather than as either side.
+        let spans = match client.runnables(&file_uri, None).await {
+            Ok(runnables) => Some(blast::test_spans(&runnables)),
+            Err(error) => {
+                debug!("No runnables for {}: {}", shown, error);
+                None
+            }
+        };
+        let symbols = client
+            .document_symbols(&file_uri)
+            .await
+            .unwrap_or(Value::Null);
+
+        context.insert(
+            shown,
+            blast::FileContext {
+                test_spans: spans,
+                symbols,
+            },
+        );
+    }
+
+    let target = json!({
+        "file": file_path,
+        "line": line,
+        "character": character,
+        "signature": signature,
+    });
+    let answer = blast::assemble(target, &annotated, &context, &implementations);
+
+    Ok(ToolResult {
+        content: vec![ContentItem {
+            content_type: "text".to_string(),
+            text: serde_json::to_string_pretty(&answer)?,
+        }],
+    })
+}
+
+/// The distinct files a reference list points into, in the order they are first mentioned.
+fn referenced_files(references: &Value) -> Vec<PathBuf> {
+    let Some(items) = references.as_array() else {
+        return Vec::new();
+    };
+
+    let mut files = Vec::new();
+    for item in items {
+        let Some(path) = item
+            .get("uri")
+            .and_then(Value::as_str)
+            .and_then(uri::uri_to_path)
+        else {
+            continue;
+        };
+        if !files.contains(&path) {
+            files.push(path);
+        }
+    }
+    files
 }
 
 async fn handle_completion(server: &mut RustAnalyzerMCPServer, args: Value) -> Result<ToolResult> {
