@@ -39,7 +39,7 @@ async fn renaming_a_symbol_says_what_it_would_take() -> Result<()> {
         // Last edit first, so applying them one after another needs no arithmetic.
         let lines: Vec<Value> = edits.iter().map(|edit| edit["line"].clone()).collect();
         let mut last_first = lines.clone();
-        last_first.sort_by(|a, b| b.as_u64().cmp(&a.as_u64()));
+        last_first.sort_by_key(|line| std::cmp::Reverse(line.as_u64()));
         assert_eq!(lines, last_first, "{rename}");
     }
 
