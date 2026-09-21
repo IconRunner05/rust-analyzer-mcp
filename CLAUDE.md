@@ -13,7 +13,7 @@ it.
 the revision and tool count are what tell them apart:
 
 ```
-rust-analyzer-mcp 0.4.0 (fork, rev 9d3233e, 21 tools)
+rust-analyzer-mcp 0.4.0 (fork, rev <short sha>, 21 tools)
 ```
 
 ## Architecture
@@ -56,6 +56,13 @@ speaks them:
   comment.
 - **Nothing here writes to a file.** `format`, `rename` and `ssr` all work out an edit and hand it
   back; applying it is the caller's decision. That is why all three are annotated `readOnlyHint`.
+- **A tool description is read by a model, not by a person browsing docs.** The whole listing goes
+  out at the start of every session holding this server, so a sentence in it is paid for per seat
+  rather than per repo. Write what changes what the caller does -- the shape of the answer, and
+  the traps that make a wrong answer look like a right one -- and leave the rationale to the doc
+  comment on the handler, which costs nothing to ship. The shared parameter text lives in
+  `WORKSPACE`/`FILE`/`LINE`/`CHARACTER` and the shared schemas in `at_position()`/`in_file()`,
+  because the same paragraph repeated across twenty tools was two thirds of the listing.
 
 ## Development Commands
 
