@@ -1,11 +1,15 @@
 use anyhow::Result;
 use serde_json::{json, Value};
 use std::{
+    collections::HashSet,
     io::{BufRead, BufReader, Write},
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex, OnceLock,
+    },
     thread,
     time::Duration,
 };
@@ -17,6 +21,92 @@ const TOOL_CALL_ATTEMPTS: u32 = 3;
 
 /// Size past which a daemon's log file is rotated before launching another daemon.
 const MAX_DAEMON_LOG_BYTES: u64 = 8 * 1024 * 1024;
+
+/// The newest of the binaries a shared daemon is made of, as nanoseconds since the epoch.
+///
+/// The daemon runs `rust-analyzer-mcp` as its child, so those two binaries are what a test
+/// actually exercises, and their mtime is what says whether a daemon already running is running
+/// the code under test.
+fn build_stamp(project_root: &Path) -> Option<u128> {
+    let profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
+
+    ["test-support-server", "rust-analyzer-mcp"]
+        .iter()
+        .filter_map(|name| {
+            std::fs::metadata(project_root.join(format!("target/{profile}/{name}")))
+                .ok()?
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|since| since.as_nanos())
+        })
+        .max()
+}
+
+/// Stops a daemon left running by an earlier build, before anything connects to it.
+///
+/// A daemon outlives the `cargo test` that started it -- that is the point of sharing one -- and
+/// replacing a binary does not change a process already running it. So a rebuild leaves a daemon
+/// serving code that no longer exists, and the tests pass against it: measured while checking
+/// that a read-only hint could fail, where the unit test went red and the integration test
+/// covering the same claim stayed green, because it was asking a daemon built minutes earlier.
+/// An integration test that cannot see the change it is testing is worse than no integration
+/// test, since it reports success either way.
+///
+/// Killing the daemon is enough to take its child with it: the MCP server exits when its stdin
+/// reaches EOF, which is what the closing pipe gives it.
+///
+/// Done once per process per project. Tests within a binary share a daemon and run concurrently,
+/// and retiring one out from under a test that is already talking to it would be a new way to
+/// fail.
+fn retire_stale_daemon(project_type: &str, project_root: &Path, sock_path: &Path) {
+    static CHECKED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let checked = CHECKED.get_or_init(|| Mutex::new(HashSet::new()));
+    if !checked
+        .lock()
+        .map(|mut checked| checked.insert(project_type.to_string()))
+        .unwrap_or(false)
+    {
+        return;
+    }
+
+    if !sock_path.exists() {
+        return;
+    }
+
+    let stamp_path = sock_path.with_extension("build");
+    let recorded = std::fs::read_to_string(&stamp_path)
+        .ok()
+        .and_then(|text| text.trim().parse::<u128>().ok());
+
+    // A missing stamp is not evidence the daemon is current: it is a daemon of unknown
+    // provenance, which is the case this exists to rule out.
+    if recorded.is_some() && recorded == build_stamp(project_root) {
+        return;
+    }
+
+    eprintln!("Retiring the {project_type} daemon: it is not running the build under test",);
+
+    // The project type is the last argument of the daemon's command line, so anchoring on it
+    // names one daemon. Without the anchor `test-project` would also match
+    // `test-project-singleton`, whose daemon nobody asked about.
+    let _ = Command::new("pkill")
+        .arg("-f")
+        .arg("--")
+        .arg(format!("--project-type {project_type}$"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+
+    // The socket outlives the process that bound it, and a stale one would be connected to.
+    let _ = std::fs::remove_file(sock_path);
+    let _ = std::fs::remove_file(&stamp_path);
+}
 
 /// Client that connects to the IPC MCP server
 pub struct IpcClient {
@@ -64,6 +154,8 @@ impl IpcClient {
         };
 
         let sock_path = socket_path(project_type);
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
+        retire_stale_daemon(project_type, Path::new(&manifest_dir), &sock_path);
 
         // Try to connect to existing server
         if let Ok(client) = Self::connect(&sock_path, workspace_path.clone()) {
@@ -75,7 +167,6 @@ impl IpcClient {
         eprintln!("Starting new MCP server for {}", project_type);
 
         // Always build the server - cargo will handle locking and skip if already built
-        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
         let project_root = Path::new(&manifest_dir);
 
         eprintln!("Ensuring test-support-server is built...");
@@ -141,6 +232,13 @@ impl IpcClient {
             .stdout(Stdio::null())
             .stderr(Stdio::from(log_file))
             .spawn()?;
+
+        // Record which build this daemon is, so the next run can tell whether it is still the
+        // one under test. Written after the spawn and before the connect, so a daemon is never
+        // reachable without a stamp beside it.
+        if let Some(stamp) = build_stamp(project_root) {
+            let _ = std::fs::write(sock_path.with_extension("build"), stamp.to_string());
+        }
 
         // Wait for server to start
         let mut attempts = 0;
