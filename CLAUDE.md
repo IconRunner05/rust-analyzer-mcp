@@ -51,6 +51,12 @@ speaks them:
   from the one file — but retries behind the gate if the answer is `null`.
 - **An empty answer is explained** (`explain_empty_answer`) when the loaded workspace accounts for
   it: a file outside the root, or a root with no `Cargo.toml`.
+- **A runnable's range is the code it would run, except a doctest's.** `blast.rs` splits hits on
+  rust-analyzer's test runnables, and a `doctest` runnable reports the range of the *item the doc
+  comment is attached to* — signature and body — not of the fenced lines. Trusting it files every
+  reference inside a documented function under `tests`. Nothing is lost by dropping it: doctest
+  code is a string in a comment and no reference edge resolves into it, so a doctest span can
+  never hold a hit that is its own.
 - **Coordinates are 0-based**, and positions are on the identifier. `symbols` returns hierarchical
   `DocumentSymbol`s, so `selectionRange.start` is the identifier and `range.start` is the doc
   comment.
@@ -98,8 +104,11 @@ check is decoration. Two measured examples from this repo:
   workspace", so it matched `cargo` while the tool reported the wrong set entirely. A workspace
   test needs at least two faulted files in two files.
 - `test-project/src/blast_fixture.rs` exists because a test/production split is only falsifiable
-  when production code and its `#[cfg(test)]` tests share a file. A split by filename reports 3
-  production callers and 0 tests there; the real one reports 1 and 2.
+  when production code and its `#[cfg(test)]` tests share a file. A split by filename reports 4
+  production callers and 0 tests there; the real one reports 2 and 2. One of the two production
+  callers carries a doctest, so the fixture also discriminates a rule that is wrong the other
+  way — trusting a doctest runnable's range reports 1 and 3 — and no count it produces is
+  reachable by either wrong rule.
 
 Confirm a new check by deliberately breaking what it guards and watching it go red. Every number
 matching on the first try is a reason to test whether the fixture discriminates, not evidence that

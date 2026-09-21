@@ -12,7 +12,9 @@
 //! exactly like a symbol no test covers. rust-analyzer already knows better: it offers to run each
 //! test, and each offer carries the range of the thing it would run. A hit inside one of those
 //! ranges is a test hit, whatever the file is called, and the offer's label names the test for
-//! free.
+//! free. One kind of offer does not carry that range and cannot be used -- a doctest's range is
+//! the item its doc comment is attached to, body included; `is_test_label` is where that is
+//! handled and why.
 //!
 //! What this module cannot see is a *copy*. Reference edges are resolved from one definition, so a
 //! byte-identical function pasted into another crate has no edge to this one and appears in no
@@ -47,8 +49,9 @@ impl TestSpan {
 ///
 /// Two things are dropped. Runnables with no `location` -- `cargo check -p <crate>` and
 /// `cargo test -p <crate>`, which stand for the whole package rather than a place in the file --
-/// would otherwise be spans with no range. And runnables that are not tests: a `run` runnable for
-/// `fn main` is an offer to run the program, not a test, and the code around it is production.
+/// would otherwise be spans with no range. And runnables whose range is not a range of test code:
+/// a `run` runnable for `fn main` is an offer to run the program, not a test, and a `doctest`'s
+/// range is the documented item rather than the doctest. `is_test_label` decides both.
 pub fn test_spans(runnables: &Value) -> Vec<TestSpan> {
     let Some(items) = runnables.as_array() else {
         return Vec::new();
@@ -79,13 +82,28 @@ pub fn test_spans(runnables: &Value) -> Vec<TestSpan> {
 /// Whether a runnable's label describes something that is not production code.
 ///
 /// rust-analyzer's labels are a kind followed by a path, and the kind is the whole of what is
-/// needed here: `test`, `test-mod`, `doctest` and `bench` are all code that ships with the crate
-/// but does not run in it. The distinction being drawn is not "is it a `#[test]`" but "would a
-/// caller here constrain the production API", and a benchmark constrains it the same way a test
-/// does -- so it goes on the same side, under its own label, which says which it was.
+/// needed here: `test`, `test-mod` and `bench` are all code that ships with the crate but does not
+/// run in it. The distinction being drawn is not "is it a `#[test]`" but "would a caller here
+/// constrain the production API", and a benchmark constrains it the same way a test does -- so it
+/// goes on the same side, under its own label, which says which it was.
+///
+/// `doctest` is deliberately NOT among them, and it is the one kind whose range cannot be used.
+/// The others are offers to run a span of code and their range is that code; a doctest's range is
+/// **the item the doc comment is attached to** -- its signature and its whole body, none of which
+/// is the doctest. Measured on a two-caller fixture: `doctest documented_caller` came back
+/// spanning lines 0 to 7, which is the doc comment, the `pub fn` line and the body under it.
+/// Treating that as a test span files every reference inside a documented function under `tests`,
+/// so a heavily-used helper answers `production: 0` on a crate whose standard is to document its
+/// public surface -- and the better documented the code, the more of it disappears.
+///
+/// Nothing is lost by dropping it, because no reference edge ever lands in a doctest. Doctest code
+/// is a string in a comment, compiled as its own crate, and rust-analyzer does not resolve it:
+/// measured on the same fixture, a `pub fn` called in its own doctest has a reference count of 1,
+/// the declaration alone. So a doctest span can never capture a hit that belongs to it. It can
+/// only take one that belongs to the item it is written on.
 fn is_test_label(label: &str) -> bool {
     let kind = label.split_whitespace().next().unwrap_or_default();
-    matches!(kind, "test" | "test-mod" | "doctest" | "bench")
+    matches!(kind, "test" | "test-mod" | "bench")
 }
 
 /// The innermost test span covering a line, or `None` if the line is not in a test.
@@ -383,24 +401,41 @@ mod tests {
     }
 
     #[test]
-    fn benches_and_doctests_are_not_production() {
-        let spans = test_spans(&json!([
-            {
-                "label": "bench parse",
-                "location": {"targetRange": {
-                    "start": {"line": 1, "character": 0},
-                    "end": {"line": 5, "character": 1}
-                }}
-            },
-            {
-                "label": "doctest uri::absolute",
-                "location": {"targetRange": {
-                    "start": {"line": 8, "character": 0},
-                    "end": {"line": 12, "character": 1}
-                }}
-            },
-        ]));
-        assert_eq!(spans.len(), 2);
+    fn a_bench_is_not_production() {
+        let spans = test_spans(&json!([{
+            "label": "bench parse",
+            "location": {"targetRange": {
+                "start": {"line": 1, "character": 0},
+                "end": {"line": 5, "character": 1}
+            }}
+        }]));
+        assert_eq!(
+            spans.len(),
+            1,
+            "a benchmark constrains the production API the way a test does"
+        );
+    }
+
+    /// This assertion was inverted until 2026-09-21, and the test asserting the opposite is how
+    /// the bug shipped: a doctest *is* a test, so counting its range as a test span reads as
+    /// obviously right, and a hand-written fixture will give it whatever range the author
+    /// expects. The range is the whole of the difference -- 0 to 7 below is what the running
+    /// server actually returns for `doctest documented_caller`, and it is the function itself,
+    /// not the four lines of fenced code inside its doc comment.
+    #[test]
+    fn a_doctests_range_is_the_documented_item_so_it_is_not_a_test_span() {
+        let spans = test_spans(&json!([{
+            "label": "doctest documented_caller",
+            "location": {"targetRange": {
+                "start": {"line": 0, "character": 0},
+                "end": {"line": 7, "character": 1}
+            }}
+        }]));
+        assert!(
+            spans.is_empty(),
+            "a doctest's span covers the documented function's own body, so every hit it could \
+             capture is production"
+        );
     }
 
     #[test]
@@ -515,6 +550,88 @@ mod tests {
             answer["tests"]["references"][0]["test"],
             "test uri::tests::unix_paths_round_trip"
         );
+    }
+
+    /// The minimal repro that established the doctest bug, in the shape `assemble` sees it: two
+    /// callers of one private helper, one carrying a doctest and the other -- the control that
+    /// says the variable is the doctest rather than merely being documented -- carrying rustdoc
+    /// with no code fence.
+    fn documented_callers() -> BTreeMap<String, FileContext> {
+        let runnables = json!([{
+            "label": "doctest documented_caller",
+            "location": {"targetRange": {
+                "start": {"line": 0, "character": 0},
+                "end": {"line": 7, "character": 1}
+            }}
+        }]);
+        let symbols = json!([
+            {
+                "name": "documented_caller",
+                "kind": 12,
+                "range": {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 7, "character": 1}
+                },
+                "selectionRange": {
+                    "start": {"line": 5, "character": 7},
+                    "end": {"line": 5, "character": 24}
+                },
+                "children": []
+            },
+            {
+                "name": "undocumented_caller",
+                "kind": 12,
+                "range": {
+                    "start": {"line": 9, "character": 0},
+                    "end": {"line": 14, "character": 1}
+                },
+                "selectionRange": {
+                    "start": {"line": 12, "character": 7},
+                    "end": {"line": 12, "character": 26}
+                },
+                "children": []
+            }
+        ]);
+
+        BTreeMap::from([(
+            "src/lib.rs".to_string(),
+            FileContext {
+                test_spans: Some(test_spans(&runnables)),
+                symbols,
+            },
+        )])
+    }
+
+    #[test]
+    fn a_caller_that_carries_a_doctest_is_still_a_production_caller() {
+        // MEASURED both ways 2026-09-21 against the running server. Before the fix this answered
+        // production 1 / tests 1, the documented caller filed under `doctest documented_caller`
+        // though its hit is in the function body. On a crate whose standard is to document its
+        // public surface, a helper called only from documented functions answered
+        // `production: {count: 0}` with `complete: true` -- which reads as dead code.
+        let annotated = json!({"locations": [hit("src/lib.rs", 6), hit("src/lib.rs", 13)]});
+
+        let answer = assemble(
+            json!({"name": "helper"}),
+            &annotated,
+            &documented_callers(),
+            &json!([]),
+        );
+
+        assert_eq!(answer["production"]["count"], 2, "{answer}");
+        assert_eq!(
+            answer["tests"]["count"], 0,
+            "no reference edge reaches doctest code, so no hit here belongs to one: {answer}"
+        );
+
+        let named: Vec<&str> = answer["production"]["references"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|hit| hit["item"].as_str())
+            .collect();
+        assert_eq!(named, ["documented_caller", "undocumented_caller"]);
     }
 
     #[test]

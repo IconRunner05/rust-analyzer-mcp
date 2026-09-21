@@ -1,10 +1,12 @@
 //! Tests the one answer a blast radius gives that a reference list does not: which of the hits
 //! are tests.
 //!
-//! `src/blast_fixture.rs` is built for this. Its symbol is called once from production code and
+//! `src/blast_fixture.rs` is built for this. Its symbol is called twice from production code and
 //! twice from a `#[cfg(test)] mod tests` in the same file, so a split made by filename reports
-//! three production callers and no tests -- the numbers below are wrong in both directions under
-//! such a rule, which is what makes them worth asserting.
+//! four production callers and no tests -- the numbers below are wrong in both directions under
+//! such a rule, which is what makes them worth asserting. One of the two production callers
+//! carries a doctest, so a split that trusts a doctest runnable's range is wrong here too, and in
+//! the opposite direction: one production caller and three tests.
 
 use anyhow::Result;
 use serde_json::{json, Value};
@@ -19,7 +21,7 @@ async fn callers_in_one_file_are_split_into_tests_and_production() -> Result<()>
     let answer = call(
         &mut client,
         "rust_analyzer_blast_radius",
-        json!({ "file_path": fixture.to_str().unwrap(), "line": 9, "character": 7 }),
+        json!({ "file_path": fixture.to_str().unwrap(), "line": 14, "character": 7 }),
     )
     .await?;
 
@@ -37,13 +39,26 @@ async fn callers_in_one_file_are_split_into_tests_and_production() -> Result<()>
 
     assert_eq!(
         answer["production"]["count"],
-        json!(1),
-        "`production_caller` is the only caller outside the test module: {answer}"
+        json!(2),
+        "both callers outside the test module are production: {answer}"
     );
-    assert_eq!(
-        answer["production"]["references"][0]["item"],
-        json!("production_caller"),
+
+    let items: Vec<&str> = answer["production"]["references"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|hit| hit["item"].as_str())
+        .collect();
+    assert!(
+        items.contains(&"production_caller"),
         "a production hit is named by the item it is inside: {answer}"
+    );
+    assert!(
+        items.contains(&"documented_caller"),
+        "a caller carrying a doctest is production -- the doctest runnable's range is that whole \
+         function, so trusting it files this hit under `tests` and answers `production: 1`: \
+         {answer}"
     );
 
     assert_eq!(
@@ -66,6 +81,11 @@ async fn callers_in_one_file_are_split_into_tests_and_production() -> Result<()>
         "the hit inside a `#[test]` is named by that test: {named:?}"
     );
     assert!(
+        !named.iter().any(|label| label.starts_with("doctest")),
+        "no reference edge ever lands in doctest code -- a hit labelled with one was taken from \
+         the function the doctest is written on: {named:?}"
+    );
+    assert!(
         named.iter().any(|label| label.starts_with("test-mod")),
         "the hit inside a plain helper in `mod tests` has only the module's runnable to be \
          named by, and that is what keeps it out of the production count: {named:?}"
@@ -74,7 +94,7 @@ async fn callers_in_one_file_are_split_into_tests_and_production() -> Result<()>
     // The declaration is neither a test caller nor a production one, and is lifted out of both.
     assert_eq!(
         answer["declaration"]["line"],
-        json!(9),
+        json!(14),
         "the declaring line is reported apart from the callers: {answer}"
     );
 
