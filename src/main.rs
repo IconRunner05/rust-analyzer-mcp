@@ -17,7 +17,7 @@ fn main() -> Result<()> {
             return Ok(());
         }
         Action::Version => {
-            println!("rust-analyzer-mcp {}", env!("CARGO_PKG_VERSION"));
+            println!("{}", rust_analyzer_mcp::version());
             return Ok(());
         }
         Action::Serve {
