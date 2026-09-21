@@ -10,6 +10,7 @@ mod integration {
     mod rename;
     mod shared_test;
     mod shutdown;
+    mod ssr;
     mod symbols;
     mod workspace;
 }

@@ -226,6 +226,41 @@ impl RustAnalyzerClient {
             .await
     }
 
+    /// A structural search and replace across the workspace, resolved by type rather than by
+    /// text.
+    ///
+    /// `query` is rust-analyzer's own `pattern ==>> replacement` form, where `$name` is a
+    /// placeholder that binds an expression. What makes it different from a syntactic rewrite is
+    /// that the pattern's paths are resolved: `Foo::bar($a)` matches calls to that `Foo`, not to
+    /// every type in the workspace that happens to be spelled `Foo`. The position is what gives
+    /// it a module to resolve them from.
+    ///
+    /// `parse_only` asks whether the query is well formed without searching for anything, which
+    /// is the cheap way to find out that a pattern is wrong.
+    ///
+    /// The answer is a workspace edit and nothing is written: rust-analyzer works out the change
+    /// and hands it back, the same way `rename` does.
+    pub async fn ssr(
+        &mut self,
+        query: &str,
+        parse_only: bool,
+        uri: &str,
+        line: u32,
+        character: u32,
+    ) -> Result<Value> {
+        let params = json!({
+            "query": query,
+            "parseOnly": parse_only,
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character },
+            // An empty selection list means the whole workspace rather than nothing: the
+            // selections narrow the search when there are any.
+            "selections": [],
+        });
+
+        self.send_request("experimental/ssr", Some(params)).await
+    }
+
     /// The symbols across the whole workspace whose names match `query`.
     ///
     /// rust-analyzer scores this fuzzily rather than matching it, and answers with the best few

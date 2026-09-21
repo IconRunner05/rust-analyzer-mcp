@@ -183,6 +183,7 @@ async fn dispatch(
         "rust_analyzer_expand_macro" => handle_expand_macro(server, args).await,
         "rust_analyzer_related_tests" => handle_related_tests(server, args).await,
         "rust_analyzer_runnables" => handle_runnables(server, args).await,
+        "rust_analyzer_ssr" => handle_ssr(server, args).await,
         "rust_analyzer_incoming_calls" => handle_calls(server, args, Calls::Incoming).await,
         "rust_analyzer_outgoing_calls" => handle_calls(server, args, Calls::Outgoing).await,
         "rust_analyzer_format" => handle_format(server, args).await,
@@ -590,6 +591,52 @@ async fn handle_runnables(server: &mut RustAnalyzerMCPServer, args: Value) -> Re
 
     let result = client.runnables(&uri, position).await?;
     explain_empty_answer(server, &result, &file_path)?;
+
+    Ok(ToolResult {
+        content: vec![ContentItem {
+            content_type: "text".to_string(),
+            text: serde_json::to_string_pretty(&result)?,
+        }],
+    })
+}
+
+/// A structural search and replace whose patterns are resolved by type.
+///
+/// The thing a syntactic rewriter cannot do: `ast-grep` matching `Foo::bar($a)` matches every
+/// type in the workspace spelled `Foo`, because to a syntax tree that is all the name is. Here
+/// the pattern's paths are resolved from the module the position is in, so the match is of that
+/// `Foo` and no other.
+///
+/// Nothing is written. The answer is a workspace edit, worked out and handed back, which is what
+/// makes it safe to ask an unfamiliar query and read what it would have done.
+async fn handle_ssr(server: &mut RustAnalyzerMCPServer, args: Value) -> Result<ToolResult> {
+    let Some(query) = args["query"].as_str() else {
+        return Err(anyhow!("Missing query"));
+    };
+    let file_path = ToolParams::extract_file_path(&args)?;
+    // The position is only a place to resolve the pattern's paths from, so the top of the file is
+    // a reasonable default: a query naming nothing ambiguous does not care where it is asked.
+    let (line, character) = ToolParams::extract_position(&args).unwrap_or((0, 0));
+    let parse_only = args["parse_only"].as_bool().unwrap_or(false);
+
+    let uri = server.open_document_if_needed(&file_path).await?;
+
+    let Some(client) = server.client() else {
+        return Err(anyhow!("Client not initialized"));
+    };
+
+    ensure_index_ready(client).await?;
+
+    let result = client
+        .ssr(query, parse_only, &uri, line, character)
+        .await
+        .map_err(|error| {
+            anyhow!(
+                "{error}\n\nThe query is rust-analyzer's `pattern ==>> replacement` form, where \
+                 `$name` binds an expression -- for example `foo($a)` ==>> `bar($a)`. Ask with \
+                 parse_only to check a pattern without searching."
+            )
+        })?;
 
     Ok(ToolResult {
         content: vec![ContentItem {

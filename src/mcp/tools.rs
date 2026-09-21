@@ -1,7 +1,66 @@
-use crate::protocol::mcp::ToolDefinition;
+use crate::protocol::mcp::{ToolAnnotations, ToolDefinition};
 use serde_json::json;
 
+/// The name a person reads for each tool, and whether the tool leaves everything as it found it.
+///
+/// Kept apart from the definitions because it is a table: read down it and the read-only column
+/// is checkable at a glance, which is the property that matters about it. Written into the
+/// definitions it would be one line lost in each of twenty-one screens of schema.
+///
+/// `format`, `rename` and `ssr` are read-only because they return an edit and write nothing --
+/// the decision to change a file stays with the caller. `set_workspace` is the one that is not:
+/// it moves the default workspace for everyone sharing the server.
+const ANNOTATIONS: &[(&str, &str, bool)] = &[
+    ("rust_analyzer_hover", "Hover", true),
+    ("rust_analyzer_definition", "Go to definition", true),
+    ("rust_analyzer_references", "Find references", true),
+    ("rust_analyzer_blast_radius", "Blast radius", true),
+    ("rust_analyzer_completion", "Completions", true),
+    ("rust_analyzer_symbols", "File symbols", true),
+    (
+        "rust_analyzer_workspace_symbols",
+        "Find symbol by name",
+        true,
+    ),
+    (
+        "rust_analyzer_type_definition",
+        "Go to type definition",
+        true,
+    ),
+    ("rust_analyzer_implementation", "Find implementations", true),
+    ("rust_analyzer_expand_macro", "Expand macro", true),
+    ("rust_analyzer_related_tests", "Related tests", true),
+    ("rust_analyzer_runnables", "Runnable commands", true),
+    ("rust_analyzer_ssr", "Structural search and replace", true),
+    ("rust_analyzer_incoming_calls", "Incoming calls", true),
+    ("rust_analyzer_outgoing_calls", "Outgoing calls", true),
+    ("rust_analyzer_format", "Format", true),
+    ("rust_analyzer_code_actions", "Code actions", true),
+    ("rust_analyzer_rename", "Rename", true),
+    ("rust_analyzer_diagnostics", "Diagnostics", true),
+    (
+        "rust_analyzer_workspace_diagnostics",
+        "Workspace diagnostics",
+        true,
+    ),
+    ("rust_analyzer_set_workspace", "Set workspace", false),
+];
+
 pub fn get_tools() -> Vec<ToolDefinition> {
+    let mut tools = definitions();
+    for tool in &mut tools {
+        tool.annotations = ANNOTATIONS
+            .iter()
+            .find(|(name, _, _)| *name == tool.name)
+            .map(|(_, title, read_only)| ToolAnnotations {
+                title: (*title).to_string(),
+                read_only_hint: *read_only,
+            });
+    }
+    tools
+}
+
+fn definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: "rust_analyzer_hover".to_string(),
@@ -17,6 +76,7 @@ pub fn get_tools() -> Vec<ToolDefinition> {
                 },
                 "required": ["file_path", "line", "character"]
             }),
+            annotations: None,
         },
         ToolDefinition {
             name: "rust_analyzer_definition".to_string(),
@@ -31,6 +91,7 @@ pub fn get_tools() -> Vec<ToolDefinition> {
                 },
                 "required": ["file_path", "line", "character"]
             }),
+            annotations: None,
         },
         ToolDefinition {
             name: "rust_analyzer_references".to_string(),
@@ -50,6 +111,7 @@ pub fn get_tools() -> Vec<ToolDefinition> {
                 },
                 "required": ["file_path", "line", "character"]
             }),
+            annotations: None,
         },
         ToolDefinition {
             name: "rust_analyzer_blast_radius".to_string(),
@@ -79,6 +141,7 @@ pub fn get_tools() -> Vec<ToolDefinition> {
                 },
                 "required": ["file_path", "line", "character"]
             }),
+            annotations: None,
         },
         ToolDefinition {
             name: "rust_analyzer_completion".to_string(),
@@ -93,6 +156,7 @@ pub fn get_tools() -> Vec<ToolDefinition> {
                 },
                 "required": ["file_path", "line", "character"]
             }),
+            annotations: None,
         },
         ToolDefinition {
             name: "rust_analyzer_symbols".to_string(),
@@ -106,6 +170,7 @@ pub fn get_tools() -> Vec<ToolDefinition> {
                 },
                 "required": ["file_path"]
             }),
+            annotations: None,
         },
         ToolDefinition {
             name: "rust_analyzer_implementation".to_string(),
@@ -126,6 +191,7 @@ pub fn get_tools() -> Vec<ToolDefinition> {
                 },
                 "required": ["file_path", "line", "character"]
             }),
+            annotations: None,
         },
         ToolDefinition {
             name: "rust_analyzer_type_definition".to_string(),
@@ -144,6 +210,7 @@ pub fn get_tools() -> Vec<ToolDefinition> {
                 },
                 "required": ["file_path", "line", "character"]
             }),
+            annotations: None,
         },
         ToolDefinition {
             name: "rust_analyzer_incoming_calls".to_string(),
@@ -164,6 +231,7 @@ pub fn get_tools() -> Vec<ToolDefinition> {
                 },
                 "required": ["file_path", "line", "character"]
             }),
+            annotations: None,
         },
         ToolDefinition {
             name: "rust_analyzer_outgoing_calls".to_string(),
@@ -181,6 +249,7 @@ pub fn get_tools() -> Vec<ToolDefinition> {
                 },
                 "required": ["file_path", "line", "character"]
             }),
+            annotations: None,
         },
         ToolDefinition {
             name: "rust_analyzer_expand_macro".to_string(),
@@ -200,6 +269,7 @@ pub fn get_tools() -> Vec<ToolDefinition> {
                 },
                 "required": ["file_path", "line", "character"]
             }),
+            annotations: None,
         },
         ToolDefinition {
             name: "rust_analyzer_related_tests".to_string(),
@@ -219,6 +289,7 @@ pub fn get_tools() -> Vec<ToolDefinition> {
                 },
                 "required": ["file_path", "line", "character"]
             }),
+            annotations: None,
         },
         ToolDefinition {
             name: "rust_analyzer_runnables".to_string(),
@@ -238,6 +309,7 @@ pub fn get_tools() -> Vec<ToolDefinition> {
                 },
                 "required": ["file_path"]
             }),
+            annotations: None,
         },
         ToolDefinition {
             name: "rust_analyzer_workspace_symbols".to_string(),
@@ -260,6 +332,34 @@ pub fn get_tools() -> Vec<ToolDefinition> {
                 },
                 "required": ["query"]
             }),
+            annotations: None,
+        },
+        ToolDefinition {
+            name: "rust_analyzer_ssr".to_string(),
+            description: "Structural search and replace whose patterns are resolved by type, not \
+                          by text. `query` is rust-analyzer's `pattern ==>> replacement` form and \
+                          `$name` binds an expression: `Foo::bar($a) ==>> Foo::baz($a)`. The \
+                          difference from a syntactic rewriter is the resolution -- a syntax tree \
+                          matches every type spelled `Foo`, this matches the `Foo` that is in \
+                          scope at the position, so a rename of one crate's method does not \
+                          rewrite another's. Nothing is written: the answer is a workspace edit \
+                          worked out and handed back, so an unfamiliar query can be asked and \
+                          read. Pass parse_only to check a pattern is well formed without \
+                          searching for it."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "workspace_path": { "type": "string", "description": "Workspace this call is about, for when the server is shared and its default may be somebody else's project. That workspace's own rust-analyzer answers, and the default is left where it is. Must contain a Cargo.toml" },
+                    "query": { "type": "string", "description": "`pattern ==>> replacement`, where `$name` is a placeholder binding an expression" },
+                    "file_path": { "type": "string", "description": "A Rust file in the workspace, whose module the pattern's paths are resolved from" },
+                    "line": { "type": "number", "description": "Line number (0-based) to resolve the pattern's paths from. Defaults to the top of the file" },
+                    "character": { "type": "number", "description": "Character position (0-based). Defaults to the top of the file" },
+                    "parse_only": { "type": "boolean", "description": "Check the query is well formed without searching for it. Defaults to false" }
+                },
+                "required": ["query", "file_path"]
+            }),
+            annotations: None,
         },
         ToolDefinition {
             name: "rust_analyzer_format".to_string(),
@@ -272,6 +372,7 @@ pub fn get_tools() -> Vec<ToolDefinition> {
                 },
                 "required": ["file_path"]
             }),
+            annotations: None,
         },
         ToolDefinition {
             name: "rust_analyzer_code_actions".to_string(),
@@ -288,6 +389,7 @@ pub fn get_tools() -> Vec<ToolDefinition> {
                 },
                 "required": ["file_path", "line", "character", "end_line", "end_character"]
             }),
+            annotations: None,
         },
         ToolDefinition {
             name: "rust_analyzer_rename".to_string(),
@@ -310,6 +412,7 @@ pub fn get_tools() -> Vec<ToolDefinition> {
                 },
                 "required": ["file_path", "line", "character", "new_name"]
             }),
+            annotations: None,
         },
         ToolDefinition {
             name: "rust_analyzer_set_workspace".to_string(),
@@ -327,6 +430,7 @@ pub fn get_tools() -> Vec<ToolDefinition> {
                 },
                 "required": ["workspace_path"]
             }),
+            annotations: None,
         },
         ToolDefinition {
             name: "rust_analyzer_diagnostics".to_string(),
@@ -340,6 +444,7 @@ pub fn get_tools() -> Vec<ToolDefinition> {
                 },
                 "required": ["file_path"]
             }),
+            annotations: None,
         },
         ToolDefinition {
             name: "rust_analyzer_workspace_diagnostics".to_string(),
@@ -350,6 +455,57 @@ pub fn get_tools() -> Vec<ToolDefinition> {
                     "workspace_path": { "type": "string", "description": "Workspace this call is about, for when the server is shared and its default may be somebody else's project. That workspace's own rust-analyzer answers, and the default is left where it is. Must contain a Cargo.toml" }
                 }
             }),
+            annotations: None,
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The table and the definitions are two lists of the same tools, and nothing but this keeps
+    /// them the same list. Both directions matter: a tool added without a row shows its wire name
+    /// and is assumed to change things, and a row left behind by a rename is a label for a tool
+    /// that no longer exists.
+    #[test]
+    fn every_tool_is_annotated_and_every_annotation_names_a_tool() {
+        let tools = get_tools();
+
+        let unannotated: Vec<&str> = tools
+            .iter()
+            .filter(|tool| tool.annotations.is_none())
+            .map(|tool| tool.name.as_str())
+            .collect();
+        assert!(
+            unannotated.is_empty(),
+            "these tools would show their wire name and be assumed to write: {unannotated:?}"
+        );
+
+        let stale: Vec<&str> = ANNOTATIONS
+            .iter()
+            .map(|(name, _, _)| *name)
+            .filter(|name| !tools.iter().any(|tool| tool.name == *name))
+            .collect();
+        assert!(stale.is_empty(), "these name no tool: {stale:?}");
+    }
+
+    /// A read-only hint is a claim a client acts on, so the one tool making the opposite claim is
+    /// worth pinning: `set_workspace` moves the default workspace for everyone sharing the
+    /// server, and a run of this file that quietly makes everything read-only would not otherwise
+    /// fail.
+    #[test]
+    fn the_tool_that_changes_something_says_so() {
+        let writes: Vec<String> = get_tools()
+            .iter()
+            .filter(|tool| {
+                tool.annotations
+                    .as_ref()
+                    .is_some_and(|annotations| !annotations.read_only_hint)
+            })
+            .map(|tool| tool.name.clone())
+            .collect();
+
+        assert_eq!(writes, ["rust_analyzer_set_workspace"]);
+    }
 }

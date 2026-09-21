@@ -26,6 +26,41 @@ async fn test_server_initialization() -> Result<()> {
     Ok(())
 }
 
+/// The annotations are what a client reads to label a tool and to decide whether a call is worth
+/// asking the user about, and both only work if they survive the wire. A unit test on the
+/// definitions cannot see a serialization that drops them.
+#[tokio::test]
+async fn the_listing_carries_a_label_and_a_read_only_hint_for_every_tool() -> Result<()> {
+    let mut client = IpcClient::get_or_create("test-project").await?;
+
+    let response = client.send_request("tools/list", None).await?;
+    let tools = response["tools"].as_array().unwrap();
+
+    let unlabelled: Vec<&str> = tools
+        .iter()
+        .filter(|tool| {
+            !tool["annotations"]["title"].is_string()
+                || !tool["annotations"]["readOnlyHint"].is_boolean()
+        })
+        .filter_map(|tool| tool["name"].as_str())
+        .collect();
+    assert!(
+        unlabelled.is_empty(),
+        "these reached the client with nothing to label them by: {unlabelled:?}"
+    );
+
+    // The hint is a claim, so the listing is expected to disagree about at least one tool. A
+    // listing where everything is read-only would pass the check above and mean nothing.
+    let writes: Vec<&str> = tools
+        .iter()
+        .filter(|tool| tool["annotations"]["readOnlyHint"] == json!(false))
+        .filter_map(|tool| tool["name"].as_str())
+        .collect();
+    assert_eq!(writes, ["rust_analyzer_set_workspace"]);
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_all_lsp_tools() -> Result<()> {
     let mut client = IpcClient::get_or_create("test-project").await?;
