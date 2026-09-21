@@ -85,6 +85,31 @@ async fn runnables_give_the_cargo_command_for_a_file() -> Result<()> {
     Ok(())
 }
 
+/// Half a position used to mean "no position", which is the whole file -- a different question,
+/// answered successfully, with nothing to notice. The answer to the question that was not asked
+/// looks exactly like the answer to the one that was, so only an error can tell them apart.
+#[tokio::test]
+async fn half_a_position_is_refused_rather_than_answered_for_the_whole_file() -> Result<()> {
+    let mut client = IpcClient::get_or_create("test-project").await?;
+    let lib = client.workspace_path().join("src/lib.rs");
+
+    let complaint = client
+        .call_tool(
+            "rust_analyzer_runnables",
+            json!({ "file_path": lib.to_str().unwrap(), "line": 3 }),
+        )
+        .await
+        .expect_err("a line without a character is not a position");
+
+    let complaint = complaint.to_string();
+    assert!(
+        complaint.contains("character"),
+        "the error is expected to name the half that is missing: {complaint}"
+    );
+
+    Ok(())
+}
+
 /// `relatedTests` is an unadvertised extension, so what is being tested here is that it is
 /// answered at all -- an unknown request would fail instead. The fixture has no tests for the
 /// answer to name.

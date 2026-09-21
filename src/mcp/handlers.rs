@@ -97,6 +97,28 @@ async fn ensure_index_ready(client: &RustAnalyzerClient) -> Result<()> {
 /// chooses and nothing checks -- so a session opened outside a Rust project begins in exactly the
 /// state `set_workspace` refuses to move into, and a file inside that root passes the check below
 /// while rust-analyzer has loaded nothing at all.
+/// The cause of an empty answer that has nothing to do with the code being asked about: the
+/// server is not sitting in a Rust workspace at all, so it has indexed nothing and answers every
+/// question this way.
+///
+/// `subject` completes "rust-analyzer had nothing to say ..." -- a file for the tools that name
+/// one, a query for the one that does not.
+fn not_a_rust_workspace(server: &RustAnalyzerMCPServer, subject: &str) -> Result<()> {
+    if server.workspace_root.join("Cargo.toml").is_file() {
+        return Ok(());
+    }
+
+    Err(anyhow!(
+        "rust-analyzer had nothing to say {}, and the workspace it has loaded ({}) is not a Rust \
+         workspace: there is no Cargo.toml in it, so it has loaded nothing and every question is \
+         answered this way. That is the directory the server was started in -- it is not chosen, \
+         it is wherever the session began. Point it at the right project with \
+         rust_analyzer_set_workspace, then ask again.",
+        subject,
+        server.workspace_root.display()
+    ))
+}
+
 fn explain_empty_answer(
     server: &RustAnalyzerMCPServer,
     result: &Value,
@@ -107,18 +129,7 @@ fn explain_empty_answer(
         return Ok(());
     }
 
-    if !server.workspace_root.join("Cargo.toml").is_file() {
-        return Err(anyhow!(
-            "rust-analyzer had nothing to say about {}, and the workspace it has loaded ({}) is \
-             not a Rust workspace: there is no Cargo.toml in it, so it has loaded nothing and \
-             every question about every file is answered this way. That is the directory the \
-             server was started in -- it is not chosen, it is wherever the session began. Point \
-             it at the project this file belongs to with rust_analyzer_set_workspace, then ask \
-             again.",
-            file_path,
-            server.workspace_root.display()
-        ));
-    }
+    not_a_rust_workspace(server, &format!("about {}", file_path))?;
 
     if server
         .resolve_path(file_path)
@@ -478,6 +489,7 @@ async fn handle_type_definition(
     ensure_index_ready(client).await?;
 
     let result = client.type_definition(&uri, line, character).await?;
+    explain_empty_answer(server, &result, &file_path)?;
 
     Ok(ToolResult {
         content: vec![ContentItem {
@@ -503,6 +515,9 @@ async fn handle_implementation(
     ensure_index_ready(client).await?;
 
     let result = client.implementation(&uri, line, character).await?;
+    // An empty answer here is read as "nothing implements this trait", which is a verdict people
+    // act on -- so the one cause of it that is not about the code needs to say so instead.
+    explain_empty_answer(server, &result, &file_path)?;
 
     Ok(ToolResult {
         content: vec![ContentItem {
@@ -576,9 +591,27 @@ async fn handle_runnables(server: &mut RustAnalyzerMCPServer, args: Value) -> Re
     let file_path = ToolParams::extract_file_path(&args)?;
     // A position is optional here, unlike everywhere else: without one the answer covers the
     // whole file, which is what "how do I run this" usually means.
+    //
+    // Half a position is not a third meaning. Taking `line` without `character` as "no position"
+    // answers a question nobody asked -- the whole file's runnables, where one item's were
+    // wanted -- and answers it successfully, so there is nothing to notice. Asking for the rest
+    // of the position costs a round trip; not asking costs a wrong command run against the
+    // wrong thing.
     let position = match (args["line"].as_u64(), args["character"].as_u64()) {
         (Some(line), Some(character)) => Some((line as u32, character as u32)),
-        _ => None,
+        (None, None) => None,
+        (line, _) => {
+            let (given, missing) = match line {
+                Some(_) => ("line", "character"),
+                None => ("character", "line"),
+            };
+            return Err(anyhow!(
+                "Got {given} but not {missing}. A position needs both, and without one this \
+                 would answer for the whole file instead -- which is a different question, \
+                 answered without complaint. Pass both to narrow to one item, or neither for \
+                 the whole file."
+            ));
+        }
     };
 
     let uri = server.open_document_if_needed(&file_path).await?;
@@ -720,6 +753,12 @@ async fn handle_workspace_symbols(
     ensure_index_ready(client).await?;
 
     let result = client.workspace_symbols(query).await?;
+    // Naming no file, this cannot be told a file is outside the workspace -- but it can still be
+    // asked of a server that has loaded no workspace at all, where "no symbol by that name" and
+    // "nothing is indexed" are the same empty list.
+    if result.as_array().is_some_and(|items| items.is_empty()) {
+        not_a_rust_workspace(server, &format!("about `{}`", query))?;
+    }
 
     Ok(ToolResult {
         content: vec![ContentItem {
