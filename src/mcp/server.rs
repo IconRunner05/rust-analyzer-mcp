@@ -77,9 +77,10 @@ impl RustAnalyzerMCPServer {
 
     /// Forgets every workspace but the one in use, shutting its rust-analyzer down.
     ///
-    /// A workspace named per call is kept, on the grounds that it will be named again; moving the
-    /// default with `set_workspace` says the opposite, and an idle rust-analyzer is a gigabyte or
-    /// so of index nobody is asking about.
+    /// A workspace named per call is kept, on the grounds that it will be named again -- until
+    /// [`Self::sweep_workspaces`] proves it cannot be. Moving the default with `set_workspace`
+    /// says the opposite of all of them at once, and an idle rust-analyzer is a gigabyte or so of
+    /// index nobody is asking about.
     pub(super) async fn drop_other_workspaces(&mut self) {
         let elsewhere: Vec<PathBuf> = self
             .clients
@@ -103,7 +104,68 @@ impl RustAnalyzerMCPServer {
         self
     }
 
+    /// Forgets every workspace whose root has left the disk, and waits on every rust-analyzer that
+    /// has already exited.
+    ///
+    /// A workspace named per call is kept on the grounds that it will be named again. That holds
+    /// for a person moving between two or three checkouts; it fails for an agent that makes a
+    /// worktree, asks a few questions inside it, folds the branch and deletes the tree. A root
+    /// that is gone from disk cannot be named again, so this evicts on a proof rather than on a
+    /// guess -- and a worktree recreated at that same path holds different code, which the kept
+    /// index would go on answering for.
+    ///
+    /// Only a definite `Ok(false)` evicts. A stat that fails for any other reason -- a permission,
+    /// a filesystem that is not answering -- leaves the workspace alone: keeping one costs an
+    /// index nobody is asking about, while dropping one wrongly costs a reindex that reads as
+    /// ordinary cold-start latency rather than as a bug.
+    ///
+    /// The workspace this call is about is never swept, whatever its root is doing, because
+    /// [`Self::ensure_client_started`] would spawn it again on the next line.
+    ///
+    /// Waiting on the dead rides along here because it has the same cause. [`RustAnalyzerClient::
+    /// exit_status`] is what calls `try_wait`, and it was reached only for the workspace a call
+    /// named -- so a rust-analyzer that died in a workspace nobody asked about again was never
+    /// waited on, and sat `<defunct>` under this server for the rest of its life.
+    async fn sweep_workspaces(&mut self) {
+        let finished: Vec<(PathBuf, bool)> = self
+            .clients
+            .iter()
+            .filter(|(root, _)| **root != self.workspace_root)
+            .filter_map(|(root, client)| {
+                let gone = client.is_gone();
+                let absent = matches!(root.try_exists(), Ok(false));
+                (gone || absent).then(|| (root.clone(), gone))
+            })
+            .collect();
+
+        for (root, gone) in finished {
+            let Some(mut client) = self.clients.remove(&root) else {
+                continue;
+            };
+
+            if gone {
+                match client.exit_status() {
+                    Some(status) => info!("rust-analyzer for {} exited ({status})", root.display()),
+                    None => info!("rust-analyzer for {} closed its connection", root.display()),
+                }
+                // Nothing to hand shake with: the reader finishing means stdout closed, which
+                // rust-analyzer may be doing on its way out rather than after. force_kill covers
+                // the one that has not exited yet; the one that has is already waited on above.
+                client.force_kill().await;
+            } else {
+                info!(
+                    "Workspace {} has left the disk, shutting its rust-analyzer down",
+                    root.display()
+                );
+                // It kills the process either way, so a failed handshake is nothing to report.
+                let _ = client.shutdown().await;
+            }
+        }
+    }
+
     pub(super) async fn ensure_client_started(&mut self) -> Result<()> {
+        self.sweep_workspaces().await;
+
         // rust-analyzer does die on occasion (it panics on some requests, see open_document());
         // keeping a dead client around would fail every tool call for the rest of this server's
         // life, so respawn it instead.
@@ -546,8 +608,100 @@ mod tests {
         assert_eq!(server.resolve_path("src/nowhere.rs"), missing);
     }
 
+    #[tokio::test]
+    async fn a_workspace_that_left_the_disk_is_forgotten_and_one_still_there_is_kept() {
+        // Both halves in one fixture, because each rules out a different wrong sweep: forgetting
+        // nothing passes the second assertion, and forgetting everything passes the first.
+        let deleted = temporary_directory("left-the-disk");
+        let mut server = RustAnalyzerMCPServer::with_workspace(workspace());
+        // Neither of them may be the workspace in use, which is never swept.
+        server.workspace_root = PathBuf::from("/this-server-was-not-pointed-here");
+        for root in [workspace(), deleted.clone()] {
+            server
+                .clients
+                .insert(root.clone(), RustAnalyzerClient::new(root, json!({})));
+        }
+
+        std::fs::remove_dir_all(&deleted).unwrap();
+        server.sweep_workspaces().await;
+
+        assert!(
+            !server.clients.contains_key(&deleted),
+            "a root that is gone cannot be named again, so it must not be held"
+        );
+        assert!(
+            server.clients.contains_key(&workspace()),
+            "a root still on disk must survive: evicting one costs a reindex that reads as \
+             ordinary cold-start latency rather than as a bug"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_rust_analyzer_that_died_where_nobody_asked_again_is_waited_on() {
+        let child = tokio::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        // A root that is on disk, so that only having gone can account for the eviction.
+        let elsewhere = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+        let mut server = RustAnalyzerMCPServer::with_workspace(workspace());
+        server.clients.insert(
+            elsewhere.clone(),
+            RustAnalyzerClient::gone_over(elsewhere.clone(), Some(child)).await,
+        );
+
+        // The assertion below cannot discriminate until the child really is defunct: before that,
+        // "not a zombie" is true of a process that is simply still running.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !is_defunct(pid) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("fixture: the child never became defunct, so this proves nothing");
+
+        server.sweep_workspaces().await;
+
+        // The symptom before the mechanism, and in that order on purpose: holding the client is
+        // what leaves the child defunct, so asserting membership first would short-circuit this
+        // and leave it unable to fail for the reason it is here.
+        assert!(
+            !is_defunct(pid),
+            "pid {pid} is still <defunct>, which is what a workspace nobody asks about again used \
+             to leave under this server for the rest of its life"
+        );
+        assert!(
+            !server.clients.contains_key(&elsewhere),
+            "a client whose rust-analyzer has gone must not be held"
+        );
+    }
+
+    #[cfg(unix)]
+    fn is_defunct(pid: u32) -> bool {
+        let reported = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&reported.stdout)
+            .trim()
+            .starts_with('Z')
+    }
+
     /// A real directory, so that `canonicalize()` has something to work with.
     fn workspace() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test-project")
+    }
+
+    /// A directory of this test's own, named so that a concurrent run cannot delete it.
+    fn temporary_directory(purpose: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "rust-analyzer-mcp-{purpose}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
     }
 }

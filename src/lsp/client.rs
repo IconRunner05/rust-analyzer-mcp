@@ -559,6 +559,22 @@ impl RustAnalyzerClient {
     pub fn exit_status(&mut self) -> Option<ExitStatus> {
         self.process.as_mut()?.try_wait().ok().flatten()
     }
+
+    /// A client whose rust-analyzer has already gone: its reader has finished, which is what
+    /// [`Self::is_gone`] reports, over whatever process the caller plants.
+    ///
+    /// For testing what the *server* does with a client nobody is going to ask about again, which
+    /// is a question about the map of workspaces rather than about any one client -- so it is
+    /// asked from `mcp::server`, where these fields are not reachable.
+    #[cfg(test)]
+    pub(crate) async fn gone_over(workspace_root: PathBuf, process: Option<Child>) -> Self {
+        let mut client = Self::new(workspace_root, json!({}));
+        let mut reader = tokio::spawn(async {});
+        (&mut reader).await.unwrap();
+        client.reader = Some(reader);
+        client.process = process;
+        client
+    }
 }
 
 /// What rust-analyzer was last told about a document, so that the next thing it is told about
