@@ -1,7 +1,7 @@
 //! The command line this server is started with.
 
 use anyhow::{bail, Result};
-use std::{ffi::OsString, path::PathBuf};
+use std::{ffi::OsString, path::PathBuf, time::Duration};
 
 use crate::settings::Settings;
 
@@ -21,7 +21,10 @@ Options:
       --config <KEY=VALUE>   Set any rust-analyzer setting, such as --config check.command=clippy.
                              VALUE is read as JSON, or taken for a string if it is not JSON. May
                              be given more than once
-  -h, --help                 Print help
+      --idle-timeout <SECS>  Shut a workspace's rust-analyzer down after it has gone this long
+                             without a call; the next call naming it starts a fresh one. 0 keeps
+                             every one for the server's life [default: 1800]
+  -h, --help                Print help
   -V, --version              Print version
 ";
 
@@ -34,8 +37,14 @@ pub enum Action {
         /// The workspace to analyse, if the command line named one.
         workspace: Option<PathBuf>,
         settings: Settings,
+        /// How long a workspace may go unasked about before its rust-analyzer is shut down, or
+        /// `None` to keep every one for the server's life.
+        idle_timeout: Option<Duration>,
     },
 }
+
+/// What `--idle-timeout` is when the command line does not say.
+pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// Reads `args`, which are the arguments after the program's own name.
 ///
@@ -45,6 +54,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Action> {
     let mut args = args.into_iter();
     let mut workspace = None;
     let mut settings = Settings::default();
+    let mut idle_timeout = Some(DEFAULT_IDLE_TIMEOUT);
     let mut options_ended = false;
 
     while let Some(arg) = args.next() {
@@ -74,6 +84,13 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Action> {
                 "--no-default-features" => settings.disable_default_features()?,
                 "--features" => settings.enable_features(&value(name, inline, &mut args)?)?,
                 "--config" => settings.set(&value(name, inline, &mut args)?)?,
+                "--idle-timeout" => {
+                    let secs = value(name, inline, &mut args)?;
+                    let Ok(secs) = secs.parse::<u64>() else {
+                        bail!("--idle-timeout takes a whole number of seconds, not '{secs}'");
+                    };
+                    idle_timeout = (secs > 0).then(|| Duration::from_secs(secs));
+                }
                 _ => bail!("unknown option '{option}'\n\n{USAGE}"),
             }
             continue;
@@ -90,6 +107,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Action> {
     Ok(Action::Serve {
         workspace,
         settings,
+        idle_timeout,
     })
 }
 
@@ -124,9 +142,36 @@ mod tests {
             parse([]).unwrap(),
             Action::Serve {
                 workspace: None,
-                settings: Settings::default()
+                settings: Settings::default(),
+                idle_timeout: Some(DEFAULT_IDLE_TIMEOUT),
             }
         );
+    }
+
+    #[test]
+    fn the_idle_timeout_is_seconds_and_zero_means_never() {
+        let idle_timeout_of = |spelling: &[&str]| {
+            let Action::Serve { idle_timeout, .. } = parse(args(spelling)).unwrap() else {
+                panic!("expected a command line asking to serve");
+            };
+            idle_timeout
+        };
+
+        assert_eq!(
+            idle_timeout_of(&["--idle-timeout", "90"]),
+            Some(Duration::from_secs(90))
+        );
+        assert_eq!(
+            idle_timeout_of(&["--idle-timeout=90"]),
+            Some(Duration::from_secs(90))
+        );
+        assert_eq!(idle_timeout_of(&["--idle-timeout", "0"]), None);
+        for nonsense in [
+            &["--idle-timeout", "soon"][..],
+            &["--idle-timeout", "-1"][..],
+        ] {
+            assert!(parse(args(nonsense)).is_err(), "{nonsense:?}");
+        }
     }
 
     #[test]

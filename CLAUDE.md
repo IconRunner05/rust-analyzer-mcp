@@ -44,15 +44,16 @@ speaks them:
   `workspace_path` and is then answered by that workspace's own client *for that call only*, with
   the default left where it is — so concurrent callers can work in different repos. Only
   `set_workspace` moves the default, and doing so respawns `rust-analyzer` and reindexes.
-- **A workspace is kept until it is proved unnameable, not until it looks unused**
-  (`sweep_workspaces`, run before every tool call). The only proof taken is the root having left
-  the disk, which is what an agent's short-lived worktree does; a stat that fails for any other
-  reason keeps the workspace, because a wrong eviction surfaces as a reindex that reads as
-  ordinary cold-start latency rather than as a bug. There is deliberately **no TTL and no LRU
-  cap**: both reach a couple more cases at the price of a number to pick, and whether either is
-  needed is a question for a re-measurement, not for a guess. Waiting on a dead `rust-analyzer`
-  happens in that same pass, because `exit_status` is what calls `try_wait` and reaching it only
-  for the workspace a call named is what left children `<defunct>` for a server's whole life.
+- **A workspace is let go when its `rust-analyzer` exited, its root left the disk, or nothing has
+  asked about it for `--idle-timeout`** (`sweep_workspaces`). The sweep runs before every tool call
+  *and* on a timer in `run` — the timer is the part that matters, because the server holding
+  indexes nobody needs is the one nobody is calling (measured 2026-10-07: a background job marked
+  done two days earlier still held four, ~1 GB each). The call in progress is spared everything
+  but having exited. A let-go workspace is not refused: the next call starts a fresh one and the
+  index gate reports the cold start. The stdin reader is `Lines::next_line` because it is
+  cancellation-safe and the timer arm wins the `select!` between requests; `read_line` is not.
+  Still **no LRU cap**: nothing measured has needed one yet, and a cap too small fails as latency,
+  not as an error. Reaping rides in the same pass because `exit_status` is what calls `try_wait`.
 - **Reads are gated on the index** (`ensure_index_ready`). Everything worked out from the whole
   workspace answers `null` or `[]` until that workspace is loaded, and those are the same answers
   given for a symbol nothing refers to and a position that is not on a symbol. The gate turns the

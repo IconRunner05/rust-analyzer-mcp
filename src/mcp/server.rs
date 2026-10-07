@@ -1,10 +1,14 @@
 use anyhow::Result;
 use log::{debug, error, info, warn};
 use serde_json::json;
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 
 use crate::{
+    cli::DEFAULT_IDLE_TIMEOUT,
     lsp::RustAnalyzerClient,
     protocol::mcp::{MCPError, MCPRequest, MCPResponse},
     settings::Settings,
@@ -23,12 +27,42 @@ pub struct RustAnalyzerMCPServer {
     /// A call that names its workspace is therefore answered by that workspace's own
     /// rust-analyzer, and cannot be retargeted by anyone else. Each one costs what a
     /// rust-analyzer costs, which is why nothing spawns one implicitly: only a call that asks for
-    /// a workspace by name, or `set_workspace`, adds to this.
-    pub(super) clients: std::collections::HashMap<PathBuf, RustAnalyzerClient>,
+    /// a workspace by name, or `set_workspace`, adds to this -- and see
+    /// [`Self::sweep_workspaces`] for what takes one away.
+    pub(super) clients: std::collections::HashMap<PathBuf, Held>,
     /// The workspace a call that does not name one is answered by.
     pub(super) workspace_root: PathBuf,
     /// What rust-analyzer is asked to run with, for every rust-analyzer this server starts.
     pub(super) settings: Settings,
+    /// How long a workspace may go unasked about before its rust-analyzer is shut down, or
+    /// `None` to keep every one for the server's life.
+    pub(super) idle_timeout: Option<Duration>,
+}
+
+/// A workspace's rust-analyzer, and when a call last asked about that workspace.
+pub(super) struct Held {
+    pub(super) client: RustAnalyzerClient,
+    pub(super) last_asked: Instant,
+}
+
+impl Held {
+    fn new(client: RustAnalyzerClient) -> Self {
+        Self {
+            client,
+            last_asked: Instant::now(),
+        }
+    }
+}
+
+/// Why [`RustAnalyzerMCPServer::sweep_workspaces`] lets a workspace go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Release {
+    /// Its rust-analyzer has exited, or is on its way out.
+    Exited,
+    /// Its root is gone from disk, so nothing can name it again.
+    LeftTheDisk,
+    /// Nothing has asked about it for longer than the idle timeout.
+    Idle,
 }
 
 impl Default for RustAnalyzerMCPServer {
@@ -39,11 +73,7 @@ impl Default for RustAnalyzerMCPServer {
 
 impl RustAnalyzerMCPServer {
     pub fn new() -> Self {
-        Self {
-            clients: std::collections::HashMap::new(),
-            workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            settings: Settings::default(),
-        }
+        Self::with_workspace(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
     }
 
     pub fn with_workspace(workspace_root: PathBuf) -> Self {
@@ -51,12 +81,22 @@ impl RustAnalyzerMCPServer {
             clients: std::collections::HashMap::new(),
             workspace_root: uri::absolute(&workspace_root),
             settings: Settings::default(),
+            idle_timeout: Some(DEFAULT_IDLE_TIMEOUT),
         }
+    }
+
+    /// Shuts down a workspace's rust-analyzer once nothing has asked about it for `idle_timeout`;
+    /// `None` keeps every one for the server's life.
+    pub fn with_idle_timeout(mut self, idle_timeout: Option<Duration>) -> Self {
+        self.idle_timeout = idle_timeout;
+        self
     }
 
     /// The rust-analyzer answering for the workspace this call is about, if it has been started.
     pub(super) fn client(&mut self) -> Option<&mut RustAnalyzerClient> {
-        self.clients.get_mut(&self.workspace_root)
+        self.clients
+            .get_mut(&self.workspace_root)
+            .map(|held| &mut held.client)
     }
 
     /// Points the rest of this call at `workspace_path`, leaving the default alone.
@@ -78,7 +118,7 @@ impl RustAnalyzerMCPServer {
     /// Forgets every workspace but the one in use, shutting its rust-analyzer down.
     ///
     /// A workspace named per call is kept, on the grounds that it will be named again -- until
-    /// [`Self::sweep_workspaces`] proves it cannot be. Moving the default with `set_workspace`
+    /// [`Self::sweep_workspaces`] lets it go. Moving the default with `set_workspace`
     /// says the opposite of all of them at once, and an idle rust-analyzer is a gigabyte or so of
     /// index nobody is asking about.
     pub(super) async fn drop_other_workspaces(&mut self) {
@@ -90,10 +130,10 @@ impl RustAnalyzerMCPServer {
             .collect();
 
         for root in elsewhere {
-            if let Some(mut client) = self.clients.remove(&root) {
+            if let Some(mut held) = self.clients.remove(&root) {
                 info!("Shutting down rust-analyzer for {}", root.display());
                 // It kills the process either way, so a failed handshake is nothing to report.
-                let _ = client.shutdown().await;
+                let _ = held.client.shutdown().await;
             }
         }
     }
@@ -104,86 +144,91 @@ impl RustAnalyzerMCPServer {
         self
     }
 
-    /// Forgets every workspace whose root has left the disk, and waits on every rust-analyzer that
-    /// has already exited.
+    /// Lets go of every workspace whose rust-analyzer has exited, whose root has left the disk, or
+    /// that nothing has asked about for [`Self::idle_timeout`] -- shutting each rust-analyzer down
+    /// and waiting on it, so none is left `<defunct>`.
     ///
-    /// A workspace named per call is kept on the grounds that it will be named again. That holds
-    /// for a person moving between two or three checkouts; it fails for an agent that makes a
-    /// worktree, asks a few questions inside it, folds the branch and deletes the tree. A root
-    /// that is gone from disk cannot be named again, so this evicts on a proof rather than on a
-    /// guess -- and a worktree recreated at that same path holds different code, which the kept
-    /// index would go on answering for.
+    /// Run before every tool call and on a timer from [`Self::run`]: a server nobody is calling
+    /// is exactly the one holding indexes nobody needs, and it would never sweep if only a call
+    /// could make it.
     ///
-    /// Only a definite `Ok(false)` evicts. A stat that fails for any other reason -- a permission,
-    /// a filesystem that is not answering -- leaves the workspace alone: keeping one costs an
-    /// index nobody is asking about, while dropping one wrongly costs a reindex that reads as
-    /// ordinary cold-start latency rather than as a bug.
+    /// A workspace let go is not refused afterwards. The next call naming it starts a fresh
+    /// rust-analyzer, whose cold index the read tools already report as an error rather than as
+    /// an empty answer.
     ///
-    /// The workspace this call is about is never swept, whatever its root is doing, because
-    /// [`Self::ensure_client_started`] would spawn it again on the next line.
-    ///
-    /// Waiting on the dead rides along here because it has the same cause. [`RustAnalyzerClient::
-    /// exit_status`] is what calls `try_wait`, and it was reached only for the workspace a call
-    /// named -- so a rust-analyzer that died in a workspace nobody asked about again was never
-    /// waited on, and sat `<defunct>` under this server for the rest of its life.
-    async fn sweep_workspaces(&mut self) {
-        let finished: Vec<(PathBuf, bool)> = self
+    /// With `spare` set, the workspace this call is about keeps its rust-analyzer unless that has
+    /// exited: [`Self::ensure_client_started`] would only start it again on the next line. A root
+    /// counts as gone from disk only on a definite `Ok(false)`; a stat that fails for any other
+    /// reason is no proof of anything.
+    async fn sweep_workspaces(&mut self, now: Instant, spare: Option<PathBuf>) {
+        let released: Vec<(PathBuf, Release)> = self
             .clients
             .iter()
-            .filter(|(root, _)| **root != self.workspace_root)
-            .filter_map(|(root, client)| {
-                let gone = client.is_gone();
-                let absent = matches!(root.try_exists(), Ok(false));
-                (gone || absent).then(|| (root.clone(), gone))
+            .filter_map(|(root, held)| {
+                let why = if held.client.is_gone() {
+                    Release::Exited
+                } else if spare.as_ref() == Some(root) {
+                    return None;
+                } else if matches!(root.try_exists(), Ok(false)) {
+                    Release::LeftTheDisk
+                } else if self.idle_timeout.is_some_and(|timeout| {
+                    now.saturating_duration_since(held.last_asked) >= timeout
+                }) {
+                    Release::Idle
+                } else {
+                    return None;
+                };
+                Some((root.clone(), why))
             })
             .collect();
 
-        for (root, gone) in finished {
-            let Some(mut client) = self.clients.remove(&root) else {
+        for (root, why) in released {
+            let Some(mut held) = self.clients.remove(&root) else {
                 continue;
             };
+            let client = &mut held.client;
 
-            if gone {
-                match client.exit_status() {
-                    Some(status) => info!("rust-analyzer for {} exited ({status})", root.display()),
-                    None => info!("rust-analyzer for {} closed its connection", root.display()),
+            match why {
+                Release::Exited => {
+                    match client.exit_status() {
+                        Some(status) => {
+                            warn!("rust-analyzer for {} exited ({status})", root.display())
+                        }
+                        None => warn!("rust-analyzer for {} closed its connection", root.display()),
+                    }
+                    // Nothing to hand shake with: the reader finishing means stdout closed, which
+                    // rust-analyzer may be doing on its way out rather than after. force_kill
+                    // kills the one that has not exited yet and waits on both.
+                    client.force_kill().await;
                 }
-                // Nothing to hand shake with: the reader finishing means stdout closed, which
-                // rust-analyzer may be doing on its way out rather than after. force_kill covers
-                // the one that has not exited yet; the one that has is already waited on above.
-                client.force_kill().await;
-            } else {
-                info!(
-                    "Workspace {} has left the disk, shutting its rust-analyzer down",
-                    root.display()
-                );
-                // It kills the process either way, so a failed handshake is nothing to report.
-                let _ = client.shutdown().await;
+                Release::LeftTheDisk | Release::Idle => {
+                    info!(
+                        "Shutting down rust-analyzer for {} ({})",
+                        root.display(),
+                        match why {
+                            Release::LeftTheDisk => "its root has left the disk",
+                            _ => "idle",
+                        }
+                    );
+                    // It kills the process either way, so a failed handshake is nothing to report.
+                    let _ = client.shutdown().await;
+                }
             }
         }
     }
 
     pub(super) async fn ensure_client_started(&mut self) -> Result<()> {
-        self.sweep_workspaces().await;
+        let root = self.workspace_root.clone();
+        self.sweep_workspaces(Instant::now(), Some(root.clone()))
+            .await;
 
-        // rust-analyzer does die on occasion (it panics on some requests, see open_document());
-        // keeping a dead client around would fail every tool call for the rest of this server's
-        // life, so respawn it instead.
-        if let Some(client) = self.clients.get_mut(&self.workspace_root) {
-            if client.is_gone() {
-                match client.exit_status() {
-                    Some(status) => warn!("rust-analyzer exited ({status}), restarting it"),
-                    None => warn!("rust-analyzer closed its connection, restarting it"),
-                }
-                self.clients.remove(&self.workspace_root);
-            }
-        }
-
-        if !self.clients.contains_key(&self.workspace_root) {
-            let mut client =
-                RustAnalyzerClient::new(self.workspace_root.clone(), self.settings.to_json());
+        if !self.clients.contains_key(&root) {
+            let mut client = RustAnalyzerClient::new(root.clone(), self.settings.to_json());
             client.start().await?;
-            self.clients.insert(self.workspace_root.clone(), client);
+            self.clients.insert(root.clone(), Held::new(client));
+        }
+        if let Some(held) = self.clients.get_mut(&root) {
+            held.last_asked = Instant::now();
         }
         Ok(())
     }
@@ -195,7 +240,7 @@ impl RustAnalyzerMCPServer {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to read file {}: {}", path.display(), e))?;
 
-        let Some(client) = self.clients.get_mut(&self.workspace_root) else {
+        let Some(client) = self.client() else {
             return Err(anyhow::anyhow!("Client not initialized"));
         };
 
@@ -209,7 +254,7 @@ impl RustAnalyzerMCPServer {
     /// across the workspace and is worked out from whatever rust-analyzer holds for each file it
     /// touches. Anything stale in there comes back as an edit to a line that has moved.
     pub(super) async fn refresh_open_documents(&mut self) -> Result<()> {
-        let Some(client) = self.clients.get_mut(&self.workspace_root) else {
+        let Some(client) = self.client() else {
             return Err(anyhow::anyhow!("Client not initialized"));
         };
 
@@ -254,8 +299,12 @@ impl RustAnalyzerMCPServer {
 
         let stdin = tokio::io::stdin();
         let stdout = tokio::io::stdout();
-        let mut reader = BufReader::new(stdin);
+        // Lines rather than read_line(): next_line() is cancellation-safe, which the sweep arm
+        // below needs -- it wins the select between requests, mid-line or not.
+        let mut lines = BufReader::new(stdin).lines();
         let mut writer = BufWriter::new(stdout);
+        let mut sweep = tokio::time::interval(sweep_period(self.idle_timeout));
+        sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         // Created once, up front: the streams buffer signals delivered while a request is being
         // handled, and installing a handler permanently replaces the default disposition, so
@@ -267,10 +316,7 @@ impl RustAnalyzerMCPServer {
         let mut result = Ok(());
 
         loop {
-            let mut line = String::new();
-            // read_line() is not cancellation-safe, but the partially read line is only lost when
-            // we shut down and discard it anyway.
-            let bytes_read = tokio::select! {
+            let line = tokio::select! {
                 // Biased with the signal arm first: a signal that latched while a request was
                 // being handled must win over lines already buffered on stdin, so that no new
                 // request is accepted after shutdown was requested.
@@ -280,19 +326,20 @@ impl RustAnalyzerMCPServer {
                     signals_seen += 1;
                     break;
                 }
-                read = reader.read_line(&mut line) => match read {
-                    Ok(n) => n,
+                read = lines.next_line() => match read {
+                    Ok(Some(line)) => line,
+                    Ok(None) => break, // EOF
                     Err(e) => {
                         error!("Error reading from stdin: {}", e);
                         result = Err(e.into());
                         break;
                     }
                 },
+                _ = sweep.tick() => {
+                    self.sweep_workspaces(Instant::now(), None).await;
+                    continue;
+                }
             };
-
-            if bytes_read == 0 {
-                break; // EOF
-            }
 
             let line = line.trim();
             if line.is_empty() {
@@ -361,7 +408,7 @@ impl RustAnalyzerMCPServer {
         // killing the process, so this cannot stall. A second signal — counting the one that may
         // have triggered the exit — skips the handshake and kills rust-analyzer immediately.
         info!("Shutting down");
-        for client in self.clients.values_mut() {
+        for Held { client, .. } in self.clients.values_mut() {
             let graceful = {
                 let shutting_down = client.shutdown();
                 tokio::pin!(shutting_down);
@@ -481,6 +528,16 @@ impl RustAnalyzerMCPServer {
             },
         }
     }
+}
+
+/// How often an idle server sweeps: often enough that a workspace outlives the idle timeout by
+/// at most half of it, and that an exited rust-analyzer is waited on within a minute even with no
+/// timeout at all.
+fn sweep_period(idle_timeout: Option<Duration>) -> Duration {
+    const AT_MOST: Duration = Duration::from_secs(60);
+    idle_timeout.map_or(AT_MOST, |timeout| {
+        (timeout / 2).clamp(Duration::from_secs(1), AT_MOST)
+    })
 }
 
 /// The workspace root `workspace_path` names, refusing anything that is not one.
@@ -617,13 +674,15 @@ mod tests {
         // Neither of them may be the workspace in use, which is never swept.
         server.workspace_root = PathBuf::from("/this-server-was-not-pointed-here");
         for root in [workspace(), deleted.clone()] {
-            server
-                .clients
-                .insert(root.clone(), RustAnalyzerClient::new(root, json!({})));
+            server.clients.insert(
+                root.clone(),
+                Held::new(RustAnalyzerClient::new(root, json!({}))),
+            );
         }
 
         std::fs::remove_dir_all(&deleted).unwrap();
-        server.sweep_workspaces().await;
+        let current = server.workspace_root.clone();
+        server.sweep_workspaces(Instant::now(), Some(current)).await;
 
         assert!(
             !server.clients.contains_key(&deleted),
@@ -638,19 +697,28 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_rust_analyzer_that_died_where_nobody_asked_again_is_waited_on() {
+    async fn a_rust_analyzer_that_died_is_waited_on_whoever_is_asking() {
+        // A root that is on disk, so that only having gone can account for the eviction.
+        let elsewhere = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        // Swept by the timer, by a call about another workspace, and by a call about this one --
+        // which is spared everything except having exited, and used to be dropped unwaited.
+        for spare in [None, Some(workspace()), Some(elsewhere.clone())] {
+            a_dead_rust_analyzer_is_waited_on(elsewhere.clone(), spare).await;
+        }
+    }
+
+    #[cfg(unix)]
+    async fn a_dead_rust_analyzer_is_waited_on(elsewhere: PathBuf, spare: Option<PathBuf>) {
         let child = tokio::process::Command::new("sh")
             .args(["-c", "exit 0"])
             .spawn()
             .unwrap();
         let pid = child.id().unwrap();
-        // A root that is on disk, so that only having gone can account for the eviction.
-        let elsewhere = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 
         let mut server = RustAnalyzerMCPServer::with_workspace(workspace());
         server.clients.insert(
             elsewhere.clone(),
-            RustAnalyzerClient::gone_over(elsewhere.clone(), Some(child)).await,
+            Held::new(RustAnalyzerClient::gone_over(elsewhere.clone(), Some(child)).await),
         );
 
         // The assertion below cannot discriminate until the child really is defunct: before that,
@@ -663,20 +731,74 @@ mod tests {
         .await
         .expect("fixture: the child never became defunct, so this proves nothing");
 
-        server.sweep_workspaces().await;
+        server.sweep_workspaces(Instant::now(), spare.clone()).await;
 
         // The symptom before the mechanism, and in that order on purpose: holding the client is
         // what leaves the child defunct, so asserting membership first would short-circuit this
         // and leave it unable to fail for the reason it is here.
         assert!(
             !is_defunct(pid),
-            "pid {pid} is still <defunct>, which is what a workspace nobody asks about again used \
-             to leave under this server for the rest of its life"
+            "pid {pid} is still <defunct> after a sweep sparing {spare:?}"
         );
         assert!(
             !server.clients.contains_key(&elsewhere),
-            "a client whose rust-analyzer has gone must not be held"
+            "a client whose rust-analyzer has gone must not be held (sparing {spare:?})"
         );
+    }
+
+    #[tokio::test]
+    async fn a_workspace_nobody_asks_about_is_let_go_once_the_idle_timeout_passes() {
+        let timeout = Duration::from_secs(60);
+        let asked = Instant::now();
+        let (recent, idle, current) = (
+            workspace(),
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test-project-diagnostics"),
+        );
+        let fill = |server: &mut RustAnalyzerMCPServer| {
+            for (root, last_asked) in [
+                (&recent, asked + timeout),
+                (&idle, asked),
+                (&current, asked),
+            ] {
+                let client = RustAnalyzerClient::new(root.clone(), json!({}));
+                server
+                    .clients
+                    .insert(root.clone(), Held { client, last_asked });
+            }
+        };
+        let now = asked + timeout + Duration::from_secs(1);
+
+        // Each wrong rule fails a different assertion: never letting go keeps `idle`, timing from
+        // the server's start rather than the last call drops `recent`, and ignoring the call in
+        // progress drops `current`.
+        let mut server =
+            RustAnalyzerMCPServer::with_workspace(current.clone()).with_idle_timeout(Some(timeout));
+        fill(&mut server);
+        server.sweep_workspaces(now, Some(current.clone())).await;
+        assert!(!server.clients.contains_key(&idle), "idle past the timeout");
+        assert!(
+            server.clients.contains_key(&recent),
+            "asked about within it"
+        );
+        assert!(
+            server.clients.contains_key(&current),
+            "the call in progress"
+        );
+
+        // The timer spares nothing, the default included: a server nobody calls needs no index.
+        server.sweep_workspaces(now, None).await;
+        assert!(
+            !server.clients.contains_key(&current),
+            "idle default, swept by the timer"
+        );
+
+        // And no timeout keeps all of them for the server's life.
+        let mut server =
+            RustAnalyzerMCPServer::with_workspace(current.clone()).with_idle_timeout(None);
+        fill(&mut server);
+        server.sweep_workspaces(now + timeout * 1000, None).await;
+        assert_eq!(server.clients.len(), 3, "no timeout, nothing idle");
     }
 
     #[cfg(unix)]

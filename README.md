@@ -146,6 +146,13 @@ Anything else rust-analyzer can be configured with is available through `--confi
 rust-analyzer-mcp --config check.command=clippy --config 'check.extraArgs=["--tests"]' .
 ```
 
+### Memory
+
+Each workspace a call names gets its own rust-analyzer, at roughly a gigabyte apiece on a large
+project. One that nothing has asked about for `--idle-timeout` seconds (default 1800) is shut
+down, and the next call naming it starts a fresh one, which costs a reindex. `--idle-timeout 0`
+keeps every one for the server's life.
+
 ### Other MCP Clients
 
 For other MCP clients, run the server with:

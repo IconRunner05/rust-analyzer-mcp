@@ -11,7 +11,7 @@ fn main() -> Result<()> {
 
     // args_os() rather than args() so a workspace path that is not valid UTF-8 is passed through
     // rather than panicking.
-    let (workspace_path, settings) = match cli::parse(std::env::args_os().skip(1))? {
+    let (workspace_path, settings, idle_timeout) = match cli::parse(std::env::args_os().skip(1))? {
         Action::Help => {
             print!("{USAGE}");
             return Ok(());
@@ -23,7 +23,8 @@ fn main() -> Result<()> {
         Action::Serve {
             workspace,
             settings,
-        } => (workspace, settings),
+            idle_timeout,
+        } => (workspace, settings, idle_timeout),
     };
     let workspace_path = workspace_path
         .unwrap_or_else(|| std::env::current_dir().expect("Failed to get current directory"));
@@ -31,7 +32,9 @@ fn main() -> Result<()> {
     // Create and run the server, catching panics so an unwind cannot bypass the runtime
     // shutdown below. This only matters for debug builds and tests: release builds abort on
     // panic.
-    let mut server = RustAnalyzerMCPServer::with_workspace(workspace_path).with_settings(settings);
+    let mut server = RustAnalyzerMCPServer::with_workspace(workspace_path)
+        .with_settings(settings)
+        .with_idle_timeout(idle_timeout);
     let runtime = tokio::runtime::Runtime::new()?;
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         runtime.block_on(server.run())
